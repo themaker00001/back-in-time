@@ -113,16 +113,16 @@ tools) · `auto` · `undo` · `reverted` · `replay` · `fork` · `verify` · `s
 
 - **Undo is shown before it's done.** `undo` is a dry run unless you add `--yes`.
 - **It won't clobber later work.** If a file changed after the step that touched it, restoring is refused
-  (drift). `undo --merge` then removes only what the step added or changed and keeps the later edits (text
-  files; stops on a conflict); `--force` overwrites.
+  (drift), including when several steps changed one file. `undo --merge` then removes only what the step added or
+  changed and keeps the later edits (text files; stops on a conflict or an ambiguous match); `--force` overwrites.
 - **One-way steps are gated.** A step marked `--reversible no` won't run without `--yes`, and `auto` and
   `replay` stop in front of it every time, so yesterday's approval never covers today's send. `undo` stops
   at one instead of guessing.
 - **Wrong paths are called out.** If a step declares `--touches` and none of them changed, it says so; an
   undefined `{{variable}}` stops the step before anything runs; a path too big to snapshot (50 MB by default)
   makes the step refuse instead of pretending to be reversible; a symlink's target is tracked too.
-- **Reverting can't use a stale or missing snapshot.** A re-run after a revert takes a fresh before-state, and
-  `undo` refuses if a stored copy is missing instead of half-restoring.
+- **Reverting can't use a stale or bad snapshot.** A re-run after a revert takes a fresh before-state, and `undo`
+  refuses if a stored copy is missing or no longer matches its recorded hash, instead of half-restoring.
 - **The trace is honest.** Failures are recorded, retries keep the original snapshot, plan edits made
   mid-run are logged, and the journal is append-only.
 - **Secrets stay out.** `step`, `--param`, `--set`, `set`, and the title/goal refuse secret-looking text;
@@ -130,7 +130,7 @@ tools) · `auto` · `undo` · `reverted` · `replay` · `fork` · `verify` · `s
   diffs of your files) are gitignored; `BIT_SET` values from command output are accepted only if plainly
   shell-safe and can't override a declared parameter.
 - **One writer at a time.** Commands on a timeline take a lock, so parallel calls can't lose each other's
-  steps; a timeout or Ctrl-C kills the step's whole process group.
+  steps; a timeout, Ctrl-C or SIGTERM kills the step's whole process group.
 
 ### What it deliberately isn't
 
@@ -146,11 +146,28 @@ tools) · `auto` · `undo` · `reverted` · `replay` · `fork` · `verify` · `s
 - **Not safe to run on a ledger you didn't write.** `do`, `auto`, `replay`, `fork`, `verify` and `undo` execute
   the shell commands in `plan.json` with your privileges. Read the plan first.
 - Clone-only is partial: `snapshots/` and `diffs/` are local, so from a fresh clone you can read, replay and fork a
-  timeline, but `undo` can only run explicit `undo` commands (it says so rather than guessing).
+  timeline, but `undo` refuses steps that need a snapshot (`--force` then runs only their `undo` commands).
 - Symlinks *inside* a touched directory are kept as links, not followed. POSIX shell (macOS, Linux, WSL); secret
   scrubbing is a safety net, not a guarantee.
 
-<!-- RESULTS -->
+## Does it help? An honest answer
+
+I tested it with a no-skill baseline: an agent does a realistic job, then a **cold** agent (no skill, no memory)
+reverts or repeats it from nothing but the folder, graded by file comparison. Seven evals, one run per cell:
+
+| situation | without the skill | with the skill |
+|---|---|---|
+| The user *asks* for rollback and repeatability (5 evals) | 100%, using its own scripts | 100% |
+| The user doesn't mention undo at all (1 revert eval) | **7 of 9** things restored; it said exactly what it couldn't determine | **9 of 9**, including keeping a human's later edits |
+
+- When asked to make things reversible, a strong agent without the skill does fine: it invents a script with a
+  manifest and an undo. The skill did **not** beat it on correctness there, and it cost about 10-20% more tokens.
+- When nobody asks, the agent without the skill leaves no record, and a later revert can only be partial: it can't
+  know the original values or whose lines are whose. The skill's description led an agent to keep a ledger anyway,
+  and the revert came back whole. Recording costs more up front (+42-47% tokens in the two comparable work runs).
+- One run per cell, one model family, synthetic tasks, and the skill changed between rounds: it's a sharp smoke
+  test, not a benchmark. Method, limits and the generated table are in [`evals/results.md`](evals/results.md).
+
 
 ## Development
 
@@ -159,9 +176,9 @@ python3 -m unittest discover -s tests -v    # black-box tests: every test drives
 bash examples/demo.sh                        # the tour above
 ```
 
-Evals (`evals/`): one realistic scenario in three acts. An agent does the work with or without the skill, then
-two *cold* agents (no skill, no memory) try to revert it and to repeat it for production from nothing but
-the folder, graded by file comparison. See [`evals/README.md`](evals/README.md).
+Evals (`evals/`): two scenarios, each in acts. An agent does the work with or without the skill, then *cold*
+agents (no skill, no memory) revert it, or repeat it for production, from nothing but the folder, graded by
+file comparison. See [`evals/README.md`](evals/README.md) and [`evals/results.md`](evals/results.md).
 
 ## License
 

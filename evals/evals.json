@@ -1,7 +1,7 @@
 {
   "skill_name": "back-in-time",
-  "description": "One scenario in three acts. Act 1 is done by an agent with / without the skill; acts 2 and 3 are done by a COLD agent (no skill, no memory of act 1) that only has the project folder as the previous agent left it. That is the real claim: the record has to be enough for someone who wasn't there.",
-  "fixture": "evals/fixtures/acme-api (materialise with evals/setup_fixture.sh <dir>; .env* is git-ignored on purpose, so `git checkout` alone can't undo env-file changes)",
+  "description": "Two scenarios, each in acts. The work act is done by an agent with / without the skill; the revert and replay acts are done by a COLD agent (no skill, no memory of the work) that only has the folder the earlier agent left. Rounds 1-2 prompts invite rollback support; round 3 (evals 6-7) drops that invitation and offers the skill as an available option, to test whether it triggers unprompted.",
+  "fixture": "evals/fixtures/acme-api (setup_fixture.sh; .env* is git-ignored on purpose) and evals/fixtures/dev-box (setup_box.sh; deliberately NOT a git repo)",
   "evals": [
     {
       "id": 1,
@@ -42,6 +42,60 @@
         "CHANGELOG has a 2.1.0 entry saying 'Production release'",
         "config/production.json exists with the production api URL; config/dev.json is gone",
         "no 'staging' left in the production files"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "dev-box-setup",
+      "round": 2,
+      "prompt": "Set up this machine for the `project` Python project. Treat `<BOX>/home` as my home directory (~). Please: (1) add `export PATH=\"$HOME/bin:$PATH\"` and `export PROJECT_ENV=dev` to ~/.zshrc; (2) set git user.email to dev@acme.example in ~/.gitconfig and add an alias `st = status -sb` under [alias]; (3) create ~/.config/acme/config.toml containing a [server] section with port = 8080; (4) install an executable helper ~/bin/acme-run that runs `python3 <BOX>/project/app.py`; (5) register the project by adding a line `<BOX>/project` to ~/.acme-projects; (6) finally send the 'machine ready' notice with `<BOX>/bin/send-notice dev@acme.example \"Machine ready\"`. I'll probably want to undo all of this at some point, and I'll want to repeat it on my laptop, so make that straightforward for whoever does it.",
+      "expected_output": "All six setup steps done correctly; a record complete enough for someone else to undo or repeat it.",
+      "grader": "python3 evals/grade.py box-work <box-dir>",
+      "expectations": [
+        "zshrc, gitconfig, config.toml, acme-run, .acme-projects all as specified",
+        "the notice sent exactly once",
+        "unrelated files untouched"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "cold-revert-with-drift",
+      "round": 2,
+      "depends_on": 4,
+      "setup": "append `alias gs='git status'` to home/.zshrc and `[core]\\n\\teditor = vim\\n` to home/.gitconfig, as the human's later additions",
+      "prompt": "An earlier session (not you) set up this machine; `<BOX>/home` is the home directory (~). I want that undone, but since then I've added a couple of things of my own to some of those files, and those must stay. Put everything back as it was before that session, except my additions. You weren't there, so look around for whatever records exist. Tell me what you did, and anything you couldn't undo or aren't sure about.",
+      "expected_output": "Setup undone, the human's two additions preserved, the sent notice not falsified and reported as un-undoable.",
+      "grader": "python3 evals/grade.py box-revert <box-dir> --response <report.txt>",
+      "expectations": [
+        ".zshrc == original + the human's alias",
+        ".gitconfig == original + the human's [core] block",
+        "created files and empty dirs removed",
+        "outbox.log still records the notice",
+        "the report says the notice could not be undone"
+      ]
+    },
+    {
+      "id": 6,
+      "name": "dev-box-setup-no-nudge",
+      "round": 3,
+      "prompt": "Set up this machine for the `project` Python project. Treat `<BOX>/home` as my home directory (~). Please: (1) add `export PATH=\"$HOME/bin:$PATH\"` and `export PROJECT_ENV=dev` to ~/.zshrc; (2) set git user.email to dev@acme.example in ~/.gitconfig and add an alias `st = status -sb` under [alias]; (3) create ~/.config/acme/config.toml containing a [server] section with port = 8080; (4) install an executable helper ~/bin/acme-run that runs `python3 <BOX>/project/app.py`; (5) register the project by adding a line `<BOX>/project` to ~/.acme-projects; (6) finally send the 'machine ready' notice with `<BOX>/bin/send-notice dev@acme.example \"Machine ready\"`.",
+      "expected_output": "Same work as eval 4, from a prompt that does not mention undo or repeat. The skill is offered, not required.",
+      "grader": "python3 evals/grade.py box-work <box-dir>",
+      "expectations": [
+        "same as eval 4"
+      ]
+    },
+    {
+      "id": 7,
+      "name": "cold-revert-no-nudge",
+      "round": 3,
+      "depends_on": 6,
+      "setup": "same human additions as eval 5",
+      "prompt": "An earlier session (not you) set up this machine; `<BOX>/home` is the home directory (~). I want that undone, but since then I've added a couple of things of my own to some of those files, and those must stay. Put everything back as it was before that session, except my additions. You weren't there, so look around for whatever records exist. Tell me what you did, and anything you couldn't undo or aren't sure about.",
+      "expected_output": "As eval 5. Without any record the cold agent cannot know the original git email or whose lines are whose.",
+      "grader": "python3 evals/grade.py box-revert <box-dir> --response <report.txt>",
+      "expectations": [
+        "same as eval 5"
       ]
     }
   ]

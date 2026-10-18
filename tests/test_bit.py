@@ -2,10 +2,13 @@
 
 Run:  python3 -m unittest discover -s tests -v
 """
+import importlib.util
 import json
 import os
 import shlex
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -14,6 +17,14 @@ import unittest
 from pathlib import Path
 
 BIT_SRC = Path(__file__).resolve().parent.parent / "skills" / "back-in-time" / "scripts" / "bit.py"
+
+
+def load_bit():
+    """The tool as a module, for unit-level checks of helpers like has_secret()."""
+    spec = importlib.util.spec_from_file_location("bit_under_test", str(BIT_SRC))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class Sandbox:
@@ -50,7 +61,7 @@ class Sandbox:
         return os.path.lexists(str(self.dir / rel))
 
     def events(self):
-        return [json.loads(l) for l in (self.tl / "journal.jsonl").read_text().splitlines() if l.strip()]
+        return [json.loads(l) for l in (self.tl / "journal.jsonl").read_text().split("\n") if l.strip()]
 
     def plan(self):
         return json.loads((self.tl / "plan.json").read_text())
@@ -926,6 +937,253 @@ class TestReviewRegressions(BitTest):
         sb.run("do", "s1", check=0)
         sb.run("undo", "--yes", "--merge", check=0)
         self.assertFalse(sb.exists("new.txt"))
+
+
+class TestReview2Regressions(BitTest):
+    """Defects found by the second adversarial review, in code written after the first review."""
+
+    def raw(self, sb, *args, env=None, timeout=60):
+        e = dict(os.environ)
+        e.update(env or {})
+        r = subprocess.run([sys.executable, str(sb.bit)] + list(args), cwd=str(sb.dir), capture_output=True, text=True, env=e, timeout=timeout)
+        r.all = r.stdout + r.stderr
+        return r
+
+    def two_steps_on_one_file(self, sb):
+        sb.write("f.txt", "".join("l%d\n" % i for i in range(1, 16)))
+        sb.run("step", "s1", "--do", "sed -i.bak 's/^l3$/L3-by-s1/' f.txt && rm f.txt.bak", "--touches", "f.txt", check=0)
+        sb.run("step", "s2", "--do", "sed -i.bak 's/^l4$/L4-by-s2/' f.txt && rm f.txt.bak", "--touches", "f.txt", check=0)
+        sb.run("do", "s1", check=0)
+        sb.run("do", "s2", check=0)
+
+    # --- drift with several steps on one path (the 'covered' flaw)
+    def test_merge_over_two_steps_keeps_a_human_edit_far_from_both(self):
+        sb = self.sandbox()
+        self.two_steps_on_one_file(sb)
+        sb.write("f.txt", sb.read("f.txt").replace("l14\n", "HUMAN-l14\n"))
+        sb.run("undo", "--all", "--merge", "--yes", check=0)
+        self.assertEqual(sb.read("f.txt"), "".join(("HUMAN-l14\n" if i == 14 else "l%d\n" % i) for i in range(1, 16)))
+
+    def test_human_edit_between_two_steps_blocks_the_earlier_one_instead_of_destroying_it(self):
+        sb = self.sandbox()
+        sb.write("f.txt", "".join("l%d\n" % i for i in range(1, 16)))
+        sb.run("step", "s1", "--do", "sed -i.bak 's/^l3$/L3-by-s1/' f.txt && rm f.txt.bak", "--touches", "f.txt", check=0)
+        sb.run("step", "s2", "--do", "sed -i.bak 's/^l4$/L4-by-s2/' f.txt && rm f.txt.bak", "--touches", "f.txt", check=0)
+        sb.run("do", "s1", check=0)
+        sb.write("f.txt", sb.read("f.txt") + "HUMAN edit made between the steps\n")
+        sb.run("do", "s2", check=0)
+        r = sb.run("undo", "--all", "--yes", check=3)
+        self.assertIn("DRIFT", r.all)
+        self.assertIn("HUMAN edit made between the steps", sb.read("f.txt"))
+
+    def test_keep_going_never_plain_restores_over_a_blocked_later_step(self):
+        sb = self.sandbox()
+        self.two_steps_on_one_file(sb)
+        sb.write("f.txt", sb.read("f.txt") + "HUMAN edit after both\n")
+        before = sb.read("f.txt")
+        r = sb.run("undo", "--all", "--keep-going", "--yes", check=3)
+        self.assertEqual(sb.read("f.txt"), before)  # nothing clobbered
+        self.assertIn("s2", r.all)
+        self.assertIn("Still applied: s2, s1", r.all.replace("s1, s2", "s2, s1") if "Still applied: s1, s2" in r.all else r.all)
+
+    def test_retry_after_a_merged_restore_whose_undo_command_failed_is_not_stuck(self):
+        sb = self.sandbox()
+        sb.write("a.txt", "a\nb\nc\n")
+        sb.run("step", "s1", "--do", "printf 'X\\n' >> a.txt", "--touches", "a.txt", "--undo", "test -f undo-ok.flag", check=0)
+        sb.run("do", "s1", check=0)
+        sb.write("a.txt", sb.read("a.txt") + "human\n")
+        sb.run("undo", "--yes", "--merge", check=1)
+        self.assertEqual(sb.read("a.txt"), "a\nb\nc\nhuman\n")
+        sb.write("undo-ok.flag", "")
+        r = sb.run("undo", "--yes", "--merge", check=0)
+        self.assertNotIn("CONFLICT", r.all)
+        self.assertEqual(sb.read("a.txt"), "a\nb\nc\nhuman\n")
+
+    # --- merge correctness
+    def test_merge_keeps_the_humans_line_on_its_own_line_when_the_original_had_no_trailing_newline(self):
+        sb = self.sandbox()
+        sb.write("f.txt", "a\nb\nc")  # no trailing newline
+        sb.run("step", "s1", "--do", "printf 'export X=1\\n' >> f.txt", "--touches", "f.txt", check=0)
+        sb.run("do", "s1", check=0)
+        sb.write("f.txt", sb.read("f.txt") + "human\n")
+        sb.run("undo", "--yes", "--merge", check=0)
+        self.assertEqual(sb.read("f.txt"), "a\nb\nc\nhuman\n")
+
+    def test_merge_refuses_an_ambiguous_match_instead_of_guessing(self):
+        sb = self.sandbox()
+        sb.write("f.txt", "k\nk\nk\n")
+        sb.run("step", "s1", "--do", "printf 'dup\\n' >> f.txt", "--touches", "f.txt", check=0)
+        sb.run("do", "s1", check=0)
+        sb.write("f.txt", sb.read("f.txt") + "k\nk\nk\ndup\n")  # the same block now appears twice
+        before = sb.read("f.txt")
+        r = sb.run("undo", "--yes", "--merge", check=3)
+        self.assertIn("ambiguous", r.all.lower())
+        self.assertEqual(sb.read("f.txt"), before)
+
+    # --- processes and the journal
+    def test_journal_survives_line_separator_characters_in_events(self):
+        sb = self.sandbox()
+        sb.run("step", "s1", "--do", "printf 'x\\342\\200\\250y\\342\\200\\251z\\302\\205w'", "--undo", "true", check=0)
+        sb.run("do", "s1", check=0)
+        sb.run("note", "a b c\u0085d", check=0)
+        self.assertIn("s1 ", sb.run("status", check=0).all)
+        self.assertIn("applied", sb.run("status", check=0).all)
+        self.assertIn("Run 1 is complete", sb.run("next", check=0).all)
+
+    def test_timeout_kills_a_background_job_even_after_the_shell_has_exited(self):
+        sb = self.sandbox()
+        sb.run("step", "s1", "--do", "sleep 30 & echo $! > child.pid", "--undo", "true", check=0)
+        self.raw(sb, "do", "s1", env={"BIT_TIMEOUT": "1"})
+        pid = int(sb.read("child.pid"))
+        time.sleep(0.4)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_sigterm_kills_the_running_step_instead_of_orphaning_it(self):
+        sb = self.sandbox()
+        sb.run("step", "s1", "--do", "sleep 30 & echo $! > child.pid; wait", "--undo", "true", check=0)
+        p = subprocess.Popen([sys.executable, str(sb.bit), "do", "s1"], cwd=str(sb.dir), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for _ in range(100):
+            if sb.exists("child.pid") and sb.read("child.pid").strip():
+                break
+            time.sleep(0.05)
+        p.send_signal(signal.SIGTERM)
+        p.communicate(timeout=15)
+        pid = int(sb.read("child.pid"))
+        time.sleep(0.4)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_a_step_that_calls_bit_itself_does_not_deadlock_on_the_lock(self):
+        sb = self.sandbox()
+        sb.run("step", "s1", "--do", 'python3 "$BIT_ROOT/.back-in-time/bit.py" note "from inside the step"', "--undo", "true", check=0)
+        r = self.raw(sb, "do", "s1", env={"BIT_TIMEOUT": "10"}, timeout=30)
+        self.assertEqual(r.returncode, 0, r.all)
+        self.assertTrue(any(e.get("text") == "from inside the step" for e in sb.events() if e["event"] == "note"))
+
+    def test_files_bit_writes_get_ordinary_permissions_not_0600(self):
+        sb = self.sandbox()
+        sb.run("step", "s1", "--do", "true", "--undo", "true", check=0)
+        want = stat.S_IMODE(os.stat(str(sb.tl / "journal.jsonl")).st_mode)
+        for name in ("plan.json", "TIMELINE.md"):
+            self.assertEqual(stat.S_IMODE(os.stat(str(sb.tl / name)).st_mode), want, name)
+
+    def test_reverted_can_target_an_earlier_run(self):
+        sb = self.sandbox()
+        sb.run("step", "s1", "--manual", "x", "--undo-manual", "do it by hand", check=0)
+        sb.run("begin", "s1", check=0)
+        sb.run("done", "s1", check=0)
+        sb.run("replay", check=0)
+        r = sb.run("undo", "--all", "--run", "1", "--yes", check=3)
+        self.assertIn("--run 1", r.all)  # the hint names the run, so `reverted` records the right one
+        sb.run("reverted", "s1", "--run", "1", check=0)
+        self.assertEqual([e["run"] for e in sb.events() if e["event"] == "step_reverted"], [1])
+
+    def test_skip_if_does_not_hide_a_step_that_failed_in_an_earlier_run(self):
+        sb = self.sandbox()
+        sb.run("step", "s1", "--do", "touch half; test -f ok.flag", "--skip-if", "test -f half", "--undo", "rm -f half", check=0)
+        sb.run("do", "s1", check=1)
+        sb.run("replay", check=0)
+        sb.write("ok.flag", "")
+        r = sb.run("do", "s1", check=0)
+        self.assertNotIn("SKIP", r.all)
+
+    def test_an_undefined_variable_in_touches_stops_the_step_before_pre_or_skip_if_run(self):
+        sb = self.sandbox()
+        sb.run("step", "s1", "--pre", "touch pre-ran", "--do", "touch did-run", "--touches", "{{nope}}.f", "--undo", "true", check=0)
+        sb.run("do", "s1", check=2)
+        self.assertFalse(sb.exists("pre-ran"))
+        self.assertFalse(sb.exists("did-run"))
+
+    # --- snapshots
+    def test_undo_refuses_a_truncated_stored_copy(self):
+        sb = self.sandbox()
+        sb.write("a.txt", "original content, long enough\n")
+        sb.run("step", "s1", "--do", "echo changed > a.txt", "--touches", "a.txt", check=0)
+        sb.run("do", "s1", check=0)
+        (sb.tl / "snapshots" / "r1-s1" / "files" / "a.txt").write_text("orig")
+        sb.run("undo", "--yes", check=3)
+        self.assertEqual(sb.read("a.txt"), "changed\n")
+
+    def test_a_fifo_in_a_touched_directory_does_not_hang_bit(self):
+        sb = self.sandbox()
+        (sb.dir / "d").mkdir()
+        os.mkfifo(str(sb.dir / "d" / "pipe"))
+        sb.write("d/f.txt", "one\n")
+        sb.run("step", "s1", "--do", "echo two > d/f.txt", "--touches", "d", "--undo", "true", check=0)
+        r = self.raw(sb, "do", "s1", timeout=20)
+        self.assertEqual(r.returncode, 0, r.all)
+        self.raw(sb, "undo", "--yes", timeout=20)
+        self.assertEqual(sb.read("d/f.txt"), "one\n")
+        self.assertTrue(stat.S_ISFIFO(os.stat(str(sb.dir / "d" / "pipe")).st_mode))
+
+    def test_undo_removes_directories_the_step_created_but_not_ones_that_existed(self):
+        sb = self.sandbox()
+        (sb.dir / "exist").mkdir()
+        sb.run("step", "s1", "--do", "mkdir -p exist/sub/deeper && echo x > exist/sub/deeper/new.txt",
+               "--touches", "exist/sub/deeper/new.txt", check=0)
+        sb.run("do", "s1", check=0)
+        sb.run("undo", "--yes", check=0)
+        self.assertTrue(sb.exists("exist"))
+        self.assertFalse(sb.exists("exist/sub"))
+
+    def test_undo_warns_when_a_snapshot_was_taken_late(self):
+        sb = self.sandbox()
+        sb.write("a.txt", "a0\n")
+        sb.write("b.txt", "b0\n")
+        sb.run("step", "s1", "--do", "echo a1 > a.txt; test -f ok.flag && echo b1 > b.txt", "--touches", "a.txt", check=0)
+        sb.run("do", "s1", check=1)
+        sb.run("step", "s1", "--touches", "a.txt", "b.txt", check=0)
+        sb.write("ok.flag", "")
+        sb.run("do", "s1", check=0)
+        self.assertIn("late", sb.run("undo", "--yes", check=0).all.lower())
+
+    # --- scrubber
+    def test_scrubber_catches_the_common_keywordless_and_json_shaped_secrets(self):
+        bit = load_bit()
+        secrets = [
+            "curl -u admin:s3cretpw123 https://x.test",
+            "psql postgres://user:hunter22222@db.example.com/app",
+            "Authorization: Basic dXNlcjpwYXNzd29yZDEyMw==",
+            "tool --password hunter22222",
+            '{"password": "hunter22222"}',
+            '"SecretAccessKey": "abcdEFGH1234ijklMNOP5678qrstUVWX9012"',
+            "SECRET_KEY=abcdef123456",
+            "JWT_SECRET_KEY=abcdef123456",
+            "DB_PASS=hunter22222",
+            "passphrase=correct-horse-battery",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+            "key sk_live_abcdefghijklmnopqrstuvwx",
+            "npm_abcdefghijklmnopqrstuvwxyz0123456789",
+            "glpat-abcdefghijklmnopqrst",
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\nabc\n-----END PGP PRIVATE KEY BLOCK-----",
+        ]
+        missed = [x for x in secrets if not bit.has_secret(x)]
+        self.assertEqual(missed, [])
+
+    def test_scrubber_leaves_ordinary_settings_and_variable_references_alone(self):
+        bit = load_bit()
+        fine = ["echo token=$VAR", "echo token=\\$VAR", "tool --token-limit 5", "max_tokens=100", "curl -u $USER:$PASS https://x.test",
+                "bypass=yes_please", "compass=northeast", 'echo "password: {{pw}}"', "password_policy=strict", "git log -p"]
+        flagged = [x for x in fine if bit.has_secret(x)]
+        self.assertEqual(flagged, [])
+
+    def test_a_deliberate_override_lets_secret_looking_text_through(self):
+        sb = self.sandbox()
+        sb.run("step", "s1", "--do", "echo token: some-readable-prose-here", "--undo", "true", check=2)
+        r = self.raw(sb, "step", "s1", "--do", "echo token: some-readable-prose-here", "--undo", "true", env={"BIT_ALLOW_SECRET_LOOKING": "1"})
+        self.assertEqual(r.returncode, 0, r.all)
+
+    def test_commit_subjects_recorded_in_the_journal_are_scrubbed(self):
+        sb = self.sandbox()
+        subprocess.run("git init -q -b main . && git config user.email t@t && git config user.name t && git add -A && git commit -qm init",
+                       shell=True, cwd=str(sb.dir), capture_output=True)
+        sb.run("step", "s1", "--do", "echo x > f.txt && git add f.txt && git commit -qm 'rotate password=hunter22222 now'", "--undo", "true", check=2)
+        sb.run("step", "s1", "--do", "echo x > f.txt && git add f.txt && git commit -qm 'rotate creds now'", "--undo", "true", check=0)
+        sb.run("do", "s1", check=0)
+        # the subject must pass through the scrubber even if it slips in some other way
+        bit = load_bit()
+        self.assertNotIn("hunter22222", bit.redact("abc1234 rotate password=hunter22222 now"))
 
 
 if __name__ == "__main__":

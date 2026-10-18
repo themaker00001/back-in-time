@@ -29,6 +29,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -79,6 +80,13 @@ def write_atomic(path, text):
     path = Path(path)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
     try:
+        try:  # mkstemp makes 0600 files; keep the target's mode, or the usual umask-based mode for a new file
+            mode = stat.S_IMODE(os.stat(str(path)).st_mode)
+        except OSError:
+            umask = os.umask(0)
+            os.umask(umask)
+            mode = 0o666 & ~umask
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
         os.replace(tmp, str(path))
@@ -90,18 +98,35 @@ def write_atomic(path, text):
         raise
 
 
+_KW = (r"(?:password|passwd|passphrase|secret[_-]?key|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|"
+       r"signing[_-]?key|encryption[_-]?key|credentials?|"
+       r"pgpass(?:word)?|(?<![A-Za-z])pass)")
+_NOT_A_REF = r"(?!\[REDACTED|[\"']?\\?\$|[\"']?\{\{)"  # $VAR, \$VAR and {{var}} are references, not secrets
 _SECRETS = [
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S), "[REDACTED PRIVATE KEY]"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----.*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|\Z)", re.S), "[REDACTED PRIVATE KEY]"),
     (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_\-]{16,}"), "[REDACTED]"),
+    (re.compile(r"\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"), "[REDACTED]"),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"), "[REDACTED]"),
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "[REDACTED]"),
-    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED]"),
+    (re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}"), "[REDACTED]"),
+    (re.compile(r"\bnpm_[A-Za-z0-9]{30,}"), "[REDACTED]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_\-]{30,}"), "[REDACTED]"),
+    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "[REDACTED]"),
     (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"), "[REDACTED]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"), "[REDACTED JWT]"),
+    # scheme://user:password@host
+    (re.compile(r"(\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s/:@]+:)(?!\$|\{\{|\\\$)[^\s/@]{3,}(@)"), r"\1[REDACTED]\2"),
+    # Authorization: Basic|Bearer|Token|Digest <credential>, and a bare Bearer token
+    (re.compile(r"(?i)\b(Authorization\s*[:=]\s*(?:Basic|Bearer|Token|Digest)\s+)[A-Za-z0-9._~+/=\-]{8,}"), r"\1[REDACTED]"),
     (re.compile(r"(?i)\b(Bearer)\s+[A-Za-z0-9._\-]{16,}"), r"\1 [REDACTED]"),
-    # name = value, where the keyword ENDS the identifier (token= and db_password= match; max_tokens=, token_limit= and
-    # password_policy= are ordinary settings) and the literal value is at least 6 characters
-    (re.compile(r"(?i)((?:password|passwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key)\s*[=:]\s*)"
-                r"(?!\[REDACTED|[\"']?\$|[\"']?\{\{)(\"[^\"]{6,}\"|'[^']{6,}'|[^\s\"']{6,})"), r"\1[REDACTED]"),
+    # curl -u user:password
+    (re.compile(r"(?i)((?:^|\s)-u\s+)(?!\$|\{\{|\\\$)[^\s:$]+:(?!\$|\{\{)\S{4,}"), r"\1[REDACTED]"),
+    # --password VALUE / --token=VALUE style flags (--token-limit and --max-tokens are not matched)
+    (re.compile(r"(?i)(--(?:password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)(?:=|\s+))"
+                + _NOT_A_REF + r"(\"[^\"]{4,}\"|'[^']{4,}'|[^\s\"']{4,})"), r"\1[REDACTED]"),
+    # name = value / "name": "value", where the keyword ENDS the identifier (token= and DB_PASS= match; max_tokens=,
+    # token_limit=, password_policy= and bypass= are ordinary settings) and the literal value is 6+ characters
+    (re.compile(r"(?i)(" + _KW + r"[\"']?\s*[=:]\s*)" + _NOT_A_REF + r"(\"[^\"]{6,}\"|'[^']{6,}'|[^\s\"']{6,})"), r"\1[REDACTED]"),
 ]
 
 
@@ -119,11 +144,13 @@ def has_secret(text):
 
 
 def refuse_secret(what, text):
-    """The ledger is meant to be committed and handed around: never store a secret in it, refuse instead."""
-    if has_secret(text):
+    """The ledger is meant to be committed and handed around: never store a secret in it, refuse instead.
+    BIT_ALLOW_SECRET_LOOKING=1 is the deliberate override for a false positive (e.g. prose that mentions `token: ...`)."""
+    if has_secret(text) and os.environ.get("BIT_ALLOW_SECRET_LOOKING") != "1":
         raise BitError("%s looks like it contains a secret, and the plan/journal/TIMELINE.md are meant to be committed. "
                        "Pass it through an environment variable instead (reference it as \"$NAME\" in a command) and "
-                       "keep the value out of the ledger." % what)
+                       "keep the value out of the ledger. (If this is a false positive, re-run with "
+                       "BIT_ALLOW_SECRET_LOOKING=1.)" % what)
 
 
 def tail(text, n=OUT_TAIL):
@@ -189,8 +216,8 @@ def pick_timeline(root, want=None):
 def acquire_lock(tl):
     """One mutating bit command at a time per timeline (plan.json and the journal are read-modify-write).
     The flock is released when the process exits, so a crash can't leave a stale lock."""
-    if fcntl is None:
-        return None
+    if fcntl is None or os.environ.get("BIT_LOCK_TL") == str(tl):
+        return None  # a step that runs bit itself: the parent already holds the lock and is waiting for us
     fd = os.open(str(tl / ".lock"), os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -241,7 +268,8 @@ def read_events(ctx):
     path = ctx.tl / "journal.jsonl"
     events = []
     if path.exists():
-        for line in path.read_bytes().decode("utf-8", "replace").splitlines():
+        # split on "\n" only: str.splitlines() also splits on U+2028/2029/0085, which would silently drop events
+        for line in path.read_bytes().decode("utf-8", "replace").split("\n"):
             line = line.strip()
             if not line:
                 continue
@@ -263,7 +291,7 @@ def emit(ctx, run, event, **fields):
             if f.read(1) != b"\n":
                 prefix = b"\n"
     with open(str(path), "ab") as f:
-        f.write(prefix + (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8"))
+        f.write(prefix + (json.dumps(rec, ensure_ascii=True) + "\n").encode("ascii"))
     return rec
 
 
@@ -348,7 +376,7 @@ def fold(events, plan, run=None):
     runs_seen = sorted({e["run"] for e in events if isinstance(e.get("run"), int)})
     target = run if run is not None else (runs_seen[-1] if runs_seen else 1)
     st = _fold_run(events, plan, target)
-    st["earlier"] = {}
+    st["earlier"], st["earlier_status"] = {}, {}
     if run is None:
         for r in runs_seen:
             if r < target:
@@ -356,6 +384,7 @@ def fold(events, plan, run=None):
                 live = [x for x in o["order"] if o["steps"][x]["status"] in LIVE]
                 if live:
                     st["earlier"][r] = live
+                    st["earlier_status"][r] = {x: o["steps"][x]["status"] for x in live}
     st["orphans"] = orphans(events, plan)
     return st
 
@@ -381,20 +410,27 @@ def soft_render(text, variables):
 
 
 def env_for(ctx, run, sid, variables):
-    env = {"BIT_ROOT": str(ctx.root), "BIT_RUN": str(run), "BIT_STEP": sid or ""}
+    env = {"BIT_ROOT": str(ctx.root), "BIT_RUN": str(run), "BIT_STEP": sid or "", "BIT_LOCK_TL": str(ctx.tl)}
     for k, v in variables.items():
         env["BIT_VAR_%s" % k] = str(v)
     return env
 
 
 def _kill_group(p):
+    """p runs in its own session, so its pid is also its process-group id. Signal the group by that id rather than
+    asking the OS for the leader's group: the leader (the shell) may already have exited while a background job it
+    started still holds our output pipe. Returns whether a group was actually signalled."""
     try:
-        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        os.killpg(p.pid, signal.SIGKILL)
+        return True
+    except ProcessLookupError:
+        return False
     except (OSError, AttributeError):
         try:
             p.kill()
         except OSError:
             pass
+        return False
 
 
 def run_shell(ctx, cmd, env_extra, timeout=None):
@@ -410,12 +446,13 @@ def run_shell(ctx, cmd, env_extra, timeout=None):
         out, _ = p.communicate(timeout=timeout or TIMEOUT)
         return p.returncode, out.decode("utf-8", "replace"), round(time.time() - t0, 2)
     except subprocess.TimeoutExpired:
-        _kill_group(p)
+        killed = _kill_group(p)
         try:
             out, _ = p.communicate(timeout=5)
         except subprocess.TimeoutExpired:
             out = b""
-        text = out.decode("utf-8", "replace") + "\n[bit: timed out after %ss; killed its process group]" % (timeout or TIMEOUT)
+        text = out.decode("utf-8", "replace") + ("\n[bit: timed out after %ss; killed its process group]" if killed
+                                                else "\n[bit: timed out after %ss]") % (timeout or TIMEOUT)
         return 124, text, round(time.time() - t0, 2)
     except BaseException:
         _kill_group(p)
@@ -432,12 +469,28 @@ def sha_file(p):
     return h.hexdigest()
 
 
+def is_special(p):
+    """A FIFO, socket or device. Opening a FIFO blocks forever, and none of them can be copied back faithfully, so
+    they are neither hashed, snapshotted nor restored: bit leaves them alone."""
+    try:
+        m = os.lstat(str(p)).st_mode
+    except OSError:
+        return False
+    return not (stat.S_ISREG(m) or stat.S_ISDIR(m) or stat.S_ISLNK(m))
+
+
+def ignore_special(dirpath, names):
+    return [n for n in names if is_special(os.path.join(dirpath, n))]
+
+
 def dir_map(p):
     out = {}
     for dp, dns, fns in os.walk(str(p)):
         dns.sort()
         for n in sorted(fns):
             full = os.path.join(dp, n)
+            if is_special(full):
+                continue
             rel = os.path.relpath(full, str(p)).replace(os.sep, "/")
             out[rel] = ("link:" + os.readlink(full)) if os.path.islink(full) else sha_file(full)[:12]
     return out
@@ -448,7 +501,9 @@ def dir_size(p):
     for dp, _, fns in os.walk(str(p)):
         for n in fns:
             try:
-                total += os.lstat(os.path.join(dp, n)).st_size
+                m = os.lstat(os.path.join(dp, n))
+                if stat.S_ISREG(m.st_mode):
+                    total += m.st_size
             except OSError:
                 pass
     return total
@@ -541,7 +596,14 @@ def snapshot_one(ctx, run, sid, ap, key, late):
         shutil.copy2(str(ap), str(dest))
     elif st["s"] == "dir":
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(str(ap), str(dest), symlinks=True)
+        shutil.copytree(str(ap), str(dest), symlinks=True, ignore=ignore_special)
+    elif st["s"] == "absent":
+        missing, d = [], os.path.dirname(str(ap))
+        while d and not os.path.lexists(d):  # parent directories this step may create: undo removes them again if empty
+            missing.append(d)
+            d = os.path.dirname(d)
+        if missing:
+            entry["missing_parents"] = missing  # deepest first
     return entry
 
 
@@ -592,6 +654,8 @@ def snapshot_problem(ctx, run, sid, manifest, expected):
             return "the stored copy of %s is missing" % key
         if e["kind"] == "dir" and not src.is_dir():
             return "the stored copy of %s is missing" % key
+        if e["kind"] in ("file", "dir") and short(state_of(src)) != e["state"]:
+            return "the stored copy of %s is corrupt or incomplete (it no longer matches the hash recorded when it was taken)" % key
     return None
 
 
@@ -608,19 +672,51 @@ def remove_path(p):
         shutil.rmtree(p)
 
 
+def remove_created_parents(entry):
+    """The step created these directories (they did not exist at snapshot time): take them away again if empty."""
+    for d in entry.get("missing_parents") or []:
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
+
+
+def clear_dir_keep_special(dst):
+    """Empty a directory of everything bit tracks, leaving FIFOs/sockets (and the directories holding them) alone."""
+    for dp, dns, fns in os.walk(dst, topdown=False):
+        for n in fns:
+            full = os.path.join(dp, n)
+            if not is_special(full):
+                os.remove(full)
+        for n in dns:
+            full = os.path.join(dp, n)
+            if os.path.islink(full):
+                os.remove(full)
+            else:
+                try:
+                    os.rmdir(full)
+                except OSError:
+                    pass  # not empty: it holds something we leave alone
+
+
 def restore_path(ctx, run, sid, key, entry):
     ap = abs_from_key(ctx.root, key)
-    remove_path(ap)
     kind = entry["kind"]
-    if kind == "absent":
-        return
     src = snap_file(ctx, run, sid, key)
+    if kind == "dir" and ap.is_dir() and not ap.is_symlink():
+        clear_dir_keep_special(str(ap))
+        shutil.copytree(str(src), str(ap), symlinks=True, dirs_exist_ok=True, ignore=ignore_special)
+        return
+    remove_path(ap)
+    if kind == "absent":
+        remove_created_parents(entry)
+        return
     if kind == "file":
         ap.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(str(src), str(ap))
     elif kind == "dir":
         ap.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(str(src), str(ap), symlinks=True)
+        shutil.copytree(str(src), str(ap), symlinks=True, ignore=ignore_special)
     elif kind == "symlink":
         ap.parent.mkdir(parents=True, exist_ok=True)
         os.symlink(entry["state"].split(":", 1)[1], str(ap))
@@ -721,7 +817,7 @@ def git_commits_between(root, a, b):
     try:
         p = subprocess.run(["git", "-C", str(root), "log", "--oneline", "%s..%s" % (a, b)], stdout=subprocess.PIPE,
                            stderr=subprocess.DEVNULL, timeout=10)
-        return p.stdout.decode().strip().splitlines()[:10]
+        return [redact(line) for line in p.stdout.decode("utf-8", "replace").strip().splitlines()[:10]]
     except (OSError, subprocess.TimeoutExpired):
         return []
 
@@ -790,13 +886,16 @@ def exec_step(ctx, sid, approved=False):
               % (ctx.tool, sid, ctx.tool, sid))
         return 3
     gate(step, approved)
-    unfinished = ss["status"] in ("failed", "running")
+    unfinished = ss["status"] in ("failed", "running") or any(
+        o.get(sid) in ("failed", "running") for o in st["earlier_status"].values())
     if step.get("skip_if") and unfinished:
-        print("  note: skip_if ignored for %s: it failed or was interrupted before, and its own partial effects could make "
-              "skip_if true. Running it again to completion." % sid)
+        print("  note: skip_if ignored for %s: it failed or was interrupted before (in this or an earlier run), and its own "
+              "partial effects could make skip_if true. Running it again to completion." % sid)
     skip_cmd = render_cmd(step["skip_if"], variables) if step.get("skip_if") and not unfinished else None
     pre_cmd = render_cmd(step["pre"], variables) if step.get("pre") else None
     do_cmd = render_cmd(step["do"], variables)
+    for t in step.get("touches") or []:  # render now: an undefined {{var}} must stop the step before anything has run
+        render_cmd(t, variables)
     env = env_for(ctx, run, sid, variables)
 
     if skip_cmd:
@@ -901,8 +1000,8 @@ def next_step(plan, st):
 def hazards(plan, st):
     out = []
     for r, sids in sorted((st.get("earlier") or {}).items()):
-        out.append("run %d has steps that are still applied (%s): their effects are still in the world. `undo --all --run %d` "
-                   "reverts them." % (r, ", ".join(sids), r))
+        out.append("run %d has steps that are still applied or half-done (%s): their effects are still in the world. "
+                   "`undo --all --run %d` reverts them." % (r, ", ".join(sids), r))
     for r, sid, status in st.get("orphans") or []:
         out.append("step `%s` is no longer in the plan but is still %s in run %d: bit cannot revert it automatically. "
                    "Put it back in plan.json or undo its effects by hand." % (sid, status, r))
@@ -1246,10 +1345,8 @@ def cmd_step(args):
         fields["touches"] = args.touches
     fields = {k: v for k, v in fields.items() if v is not None}
     for k, v in fields.items():
-        if isinstance(v, str) and redact(v) != v:
-            raise BitError("--%s looks like it contains a secret, and plan.json/TIMELINE.md are meant to be committed. "
-                           "Reference an environment variable instead (e.g. \"$API_TOKEN\") and keep the value out of the plan."
-                           % k.replace("_", "-"))
+        if isinstance(v, str):
+            refuse_secret("--%s" % k.replace("_", "-"), v)
     existing = next((s for s in plan["steps"] if s["id"] == sid), None)
     if existing is None:
         clash = [x["id"] for x in plan["steps"] if x["id"].lower() == sid.lower()]
@@ -1313,7 +1410,7 @@ def cmd_check(args):
             for name in (VAR_RE.findall(text) if key in ("pre", "skip_if", "do", "verify", "undo") else []):
                 if name not in known:
                     warns.append("%s: {{%s}} in `%s` is not a param and no step prints `BIT_SET %s=...` (fine if you will "
-                                 "`set %s=...` or `replay --set %s=...` first; otherwise the step stops before running)"
+                                 "`set %s=...` or `replay --set %s=...` first; otherwise the step stops with an error)"
                                  % (sid, name, key, name, name, name))
             if key == "do":
                 for t in s.get("touches") or []:
@@ -1410,16 +1507,14 @@ class MergeConflict(Exception):
     pass
 
 
-def reverse_merge(ctx, run, sid, key):
-    """Put back what this step changed in a file that was edited since, keeping the later edits: find each hunk's
-    'after' block (with its context) in the file as it is now and swap the 'before' block back in. Strict: if the
-    lines around the change were edited, it is a conflict, never a guess.
+def reverse_merge(ctx, run, sid, key, text):
+    """Put back what this step changed in `text` (the file as it will be when this step is reverted, which may include
+    later human edits): find each hunk's 'after' block, with its context, exactly once and swap the 'before' block
+    back in. Strict: no match, or more than one, is a conflict, never a guess.
     -> ("text", new_text) or ("delete", None)."""
     doc = load_hunks(ctx, run, sid).get(key)
     if not doc:
         raise MergeConflict("no text diff was recorded for it (binary, large, not a plain file, or the step deleted it)")
-    path = abs_from_key(ctx.root, key)
-    text = read_small_text(path) if path.is_file() and not path.is_symlink() else None
     if text is None:
         raise MergeConflict("it is no longer a readable text file")
     lines = text.splitlines(True)
@@ -1431,8 +1526,13 @@ def reverse_merge(ctx, run, sid, key):
         hits = [j for j in range(len(lines) - n + 1) if lines[j:j + n] == block]
         if not hits:
             raise MergeConflict("hunk %d no longer matches: the lines around this step's change were edited later" % (i + 1))
-        j = min(hits, key=lambda x: abs(x - h["at"]))  # several matches: the one nearest where the step put it
-        lines[j:j + n] = h["before"]
+        if len(hits) > 1:
+            raise MergeConflict("hunk %d is ambiguous: its lines appear in %d places, so there is no safe way to tell which "
+                                "one this step changed" % (i + 1, len(hits)))
+        j, repl = hits[0], list(h["before"])
+        if repl and not repl[-1].endswith("\n") and j + n < len(lines):
+            repl[-1] += "\n"  # the original ended without a newline; a later line must not be glued onto it
+        lines[j:j + n] = repl
     new = "".join(lines)
     if doc.get("created") and new == "":
         return "delete", None
@@ -1444,14 +1544,18 @@ def revert_items(ctx, plan, st, targets, force, merge=False):
 
     Order inside one step: restore the snapshotted files first, then run the undo command on top
     (so e.g. `touches package.json package-lock.json` + `undo npm ci` restores the lockfile, then reinstalls).
-    `targets` is reverse-chronological, so for a path several steps touched only the latest one is checked for drift:
-    by the time an earlier step is reached the later one has already put the file back."""
+
+    `targets` is reverse-chronological. To judge drift correctly when several steps touched one path, the whole revert
+    is simulated in order and each path carries a *virtual* state: what the file will look like by the time the next
+    (earlier) step is reached. A later step that is blocked blocks every earlier step on that path (reverting under
+    it would overwrite its work); a later step that was merged leaves the human's edits in the text the earlier step is
+    merged against; a later plain restore leaves the file in that step's before-state."""
     items = []
-    covered = set()
+    virtual = {}  # key -> ("snap", state, snapshot_path) | ("merged", text) | ("blocked",)
     for sid in targets:
         step = get_step(plan, sid)
         ss = st["steps"][sid]
-        it = {"sid": sid, "step": step, "restore": None, "merge": {}, "cmd": None,
+        it = {"sid": sid, "step": step, "restore": None, "merge": {}, "skip": set(), "cmd": None,
               "manual": soft_render(step.get("undo_manual"), st["vars"]), "blocked": None,
               "title": stitle(step, st["vars"]), "notes": []}
         manifest = load_manifest(ctx, st["run"], sid)
@@ -1476,24 +1580,48 @@ def revert_items(ctx, plan, st, targets, force, merge=False):
                 it["restore"] = manifest
             if not it["blocked"] and not it["cmd"] and not it["restore"]:
                 if it["manual"]:
-                    it["blocked"] = ("MANUAL UNDO needed: %s  -> do it, then run `%s reverted %s --note \"...\"`"
-                                     % (it["manual"], ctx.tool, sid))
+                    it["blocked"] = ("MANUAL UNDO needed: %s  -> do it, then run `%s reverted %s --run %d --note \"...\"`"
+                                     % (it["manual"], ctx.tool, sid, st["run"]))
                 else:
                     it["blocked"] = "no undo command and no snapshot (it was done without `begin`/--touches)"
         if it["restore"] and not it["blocked"] and not force:
+            for k in it["restore"]:
+                if virtual.get(k, ("",))[0] == "blocked":
+                    it["blocked"] = ("%s is also changed by a later step that will NOT be reverted (it is blocked above), so "
+                                     "restoring this earlier step would overwrite that step's work. Resolve the later step "
+                                     "first, or use --force." % k)
+                    break
+        if it["restore"] and not it["blocked"] and not force:
+            done_states = (ss["revert_failed"] or {}).get("restored_states") or {}
             drift = []
             for k, e in it["restore"].items():
-                if k in covered:
-                    continue
-                cur = short(state_of(abs_from_key(ctx.root, k)))
-                # drifted = neither how the step left it nor how it was before (already restored by an earlier attempt)
-                if k in after and cur != after[k] and cur != e["state"]:
+                v = virtual.get(k)
+                if v is None:
+                    cur = short(state_of(abs_from_key(ctx.root, k)))
+                    if cur == done_states.get(k):  # an earlier attempt already restored it (then its undo command failed)
+                        it["skip"].add(k)
+                        it["notes"].append("%s was already restored by an earlier attempt of this undo" % k)
+                        continue
+                elif v[0] == "snap":
+                    cur = v[1]
+                else:  # "merged": by construction it differs from what this step left, by the human's edits
+                    cur = None
+                # drifted = neither how this step left it nor how it was before it ran
+                if k in after and (cur is None or (cur != after[k] and cur != e["state"])):
                     drift.append(k)
             if drift and merge:
                 conflicts = []
                 for k in drift:
+                    v = virtual.get(k)
+                    path = abs_from_key(ctx.root, k)
+                    if v is None:
+                        base = read_small_text(path) if path.is_file() and not path.is_symlink() else None
+                    elif v[0] == "merged":
+                        base = v[1]
+                    else:  # a later plain restore: the file will be that step's stored before-copy
+                        base = read_small_text(v[2]) if v[2] and Path(v[2]).is_file() else ("" if v[1] == "absent" else None)
                     try:
-                        it["merge"][k] = reverse_merge(ctx, st["run"], sid, k)
+                        it["merge"][k] = reverse_merge(ctx, st["run"], sid, k, base)
                     except MergeConflict as c:
                         conflicts.append("%s: %s" % (k, c))
                 if conflicts:
@@ -1504,7 +1632,21 @@ def revert_items(ctx, plan, st, targets, force, merge=False):
                                  "that work. Options: --merge (remove just what this step added or changed and keep the later "
                                  "edits; text files, stops on conflict) or --force (overwrite with the snapshot)."
                                  % ", ".join(drift))
-        covered |= set(manifest or {})
+        for k, e in (manifest or {}).items():
+            if e.get("late"):
+                it["notes"].append("%s was snapshotted late (the step had already run once), so its restored state may "
+                                   "include that earlier partial change" % k)
+        # what the files will look like once this item has been handled, for the earlier steps still to come
+        for k, e in (manifest or {}).items():
+            if it["blocked"]:
+                virtual[k] = ("blocked",)
+            elif k in it["skip"]:
+                virtual.pop(k, None)
+            elif k in it["merge"]:
+                kind, text = it["merge"][k]
+                virtual[k] = ("merged", text) if kind == "text" else ("snap", "absent", None)
+            elif it["restore"]:
+                virtual[k] = ("snap", e["state"], str(snap_file(ctx, st["run"], sid, k)) if e["kind"] == "file" else None)
         items.append(it)
     return items
 
@@ -1548,7 +1690,7 @@ def cmd_undo(args):
             print("          %s" % it["blocked"])
             stopped = True
             continue
-        plain = [k for k in (it["restore"] or {}) if k not in it["merge"]]
+        plain = [k for k in (it["restore"] or {}) if k not in it["merge"] and k not in it["skip"]]
         if plain:
             print("          restore files: %s" % ", ".join(plain))
         for k, (kind, _) in it["merge"].items():
@@ -1559,7 +1701,7 @@ def cmd_undo(args):
             print("          ALSO by hand afterwards: %s" % it["manual"])
         for n in it["notes"]:
             print("          note: %s" % n)
-    if any(it["blocked"] for it in items):
+    if any(it["blocked"] for it in items) and not args.keep_going:
         print("\nA blocked step stops the undo and leaves it, and everything listed after it, applied. Add --keep-going to "
               "revert every step that can be reverted and leave only the blocked ones.")
     if not args.yes:
@@ -1606,11 +1748,14 @@ def revert_one(ctx, st, it):
         restored = []
         try:
             for k, e in it["restore"].items():
+                if k in it["skip"]:
+                    continue
+                path = abs_from_key(ctx.root, k)
                 if k in it["merge"]:
                     kind, text = it["merge"][k]
-                    path = abs_from_key(ctx.root, k)
                     if kind == "delete":
                         remove_path(path)
+                        remove_created_parents(e)
                     else:
                         with open(str(path), "w", encoding="utf-8", newline="") as f:
                             f.write(text)
@@ -1619,20 +1764,24 @@ def revert_one(ctx, st, it):
                     restore_path(ctx, run, sid, k, e)
                 restored.append(k)
         except OSError as e:
-            extra.update(method="+".join(methods), detail="restore failed: %s" % e, restored=restored)
+            extra.update(method="+".join(methods), detail="restore failed: %s" % e, restored=restored,
+                         restored_states={k: short(state_of(abs_from_key(ctx.root, k))) for k in restored})
             return False, extra
         extra["restored"] = restored
         for k, e in it["restore"].items():
-            if k not in it["merge"] and short(state_of(abs_from_key(ctx.root, k))) != e["state"]:
+            if k not in it["merge"] and k not in it["skip"] and short(state_of(abs_from_key(ctx.root, k))) != e["state"]:
                 warnings.append("%s does not match its snapshot after restoring" % k)
         if it["merge"]:
             extra["merged"] = sorted(it["merge"])
+    warnings += [n for n in it["notes"] if "snapshotted late" in n]
     if it["cmd"]:
         methods.append("command")
         code, out, secs = run_shell(ctx, it["cmd"], env_for(ctx, run, sid, st["vars"]))
         extra.update(cmd=redact(it["cmd"]), exit=code, secs=secs, output=tail(out))
         if code != 0:
-            extra.update(method="+".join(methods), detail="undo command exited %s" % code)
+            # remember what the restore left behind, so a retry sees 'already restored' instead of 'edited later'
+            extra.update(method="+".join(methods), detail="undo command exited %s" % code,
+                         restored_states={k: short(state_of(abs_from_key(ctx.root, k))) for k in (it["restore"] or {})})
             print_tail(out, 15)
             return False, extra
     if it["manual"]:
@@ -1648,7 +1797,7 @@ def cmd_reverted(args):
     ctx = Ctx(args, lock=True)
     plan = load_plan(ctx)
     get_step(plan, args.id)
-    st = fold(read_events(ctx), plan)
+    st = fold(read_events(ctx), plan, args.run)
     if st["steps"][args.id]["status"] not in LIVE:
         raise BitError("%s is %s in run %s: nothing to mark as reverted." % (args.id, st["steps"][args.id]["status"], st["run"]))
     emit(ctx, st["run"], "step_reverted", step=args.id, ok=True, method="manual",
@@ -1911,6 +2060,7 @@ def build_parser():
 
     sp = add("reverted", cmd_reverted, "record that you undid a step by hand (after `undo` paused on its --undo-manual)")
     sp.add_argument("id")
+    sp.add_argument("--run", type=int, help="the run the step belongs to (default: the latest)")
     sp.add_argument("--note", help="what you did")
 
     sp = add("replay", cmd_replay, "start a new run of the same plan (optionally with new parameters)")
@@ -1944,7 +2094,14 @@ def build_parser():
     return p
 
 
+def _on_signal(signum, frame):
+    raise KeyboardInterrupt()  # same path as Ctrl-C: run_shell kills the step's process group, then we exit
+
+
 def main(argv=None):
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _on_signal)
     args = build_parser().parse_args(argv)
     try:
         code = args.func(args) or 0

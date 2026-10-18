@@ -63,7 +63,9 @@ drifted?).
 - **Revert:** `bit.py undo --all` is a dry run that prints the plan; show the user, then add `--yes`.
   `undo STEP` rewinds to just before STEP; plain `undo` reverts only the last step.
   - Files edited since the step ran: it refuses (drift) rather than clobber them. `--merge` removes only what
-    the step added or changed and keeps the later edits (text files; stops on conflict); `--force` overwrites.
+    the step added or changed and keeps the later edits (text files; stops on conflict or ambiguity); `--force`
+    overwrites. With several steps on one file the revert is simulated in order, so an edit made between or after
+    steps is never overwritten silently, and a blocked later step blocks the earlier ones on that file.
   - An irreversible step blocks the undo at that point: `--keep-going` reverts everything else and leaves it.
   - **Leave `.back-in-time/` in place** after reverting (unless the user asks otherwise): it is the audit trail
     and what `replay` needs.
@@ -75,8 +77,8 @@ drifted?).
 - **Resume** an interrupted run: `bit.py next`.
 - **A ledger you did not write is code.** Anything that runs a step (`do`, `auto`, `replay`, `fork`, `verify`,
   `undo`) executes the shell commands in `plan.json` with your privileges. Read the plan first.
-- From a clone, `snapshots/` is absent: you can read, replay and fork, but `undo` only works through explicit
-  `--undo` commands, and says so instead of guessing.
+- From a clone, `snapshots/` is absent: you can read, replay and fork. `undo` refuses a step that has `--touches`
+  there (it can't restore what it can't see); `--force` then runs only that step's `--undo` command.
 
 ## Writing steps that survive a replay
 
@@ -95,7 +97,7 @@ bit.py step ID --title "..."
 
 - **One step, one undoable unit.** Small enough that its undo is obvious.
 - **Idempotent `do`, or add `--skip-if`.** The common replay is on a world that's half done. A step that
-  failed earlier ignores its `skip_if` (its own partial effects could satisfy it).
+  failed earlier, in this run or a previous one, ignores its `skip_if` (its own partial effects could satisfy it).
 - **Parameterise.** What differs between runs (environment, version, host, path) goes in `--param name=value`
   and is written `{{name}}`, including in `--touches`. Run-time values (a created ID, a SHA): the step prints
   `BIT_SET name=value`. Values are accepted only if plainly shell-safe (letters, digits, `_ @ % + = : , . / ~ -`),
@@ -107,12 +109,14 @@ bit.py step ID --title "..."
   through a link change the target); symlinks *inside* a touched directory are kept as links, not followed.
   A path over 50 MB (`BIT_MAX_SNAPSHOT_MB`) makes `do`/`begin` refuse before running: narrow it or reverse the
   step another way. With both `--touches` and `--undo`, files are restored first, then the command runs. Don't
-  `--touches` files of a step whose undo is `git revert`.
+  `--touches` files of a step whose undo is `git revert`. `undo` also removes directories the step created
+  (if empty) and leaves FIFOs and sockets alone.
 - **Classify honestly.** `yes`, `partial` (something stays), or `no` (email sent, prod data deleted). A `no`
   step is gated: it won't run without `--yes`, which you pass only after the user said yes *to that step*.
   Better, make it reversible: back up in an earlier step and make the undo restore from it.
 - **No secrets in the plan.** Reference `$ENV_VAR`. `step`, `--param`, `--set`, `set`, and the title/goal
-  refuse secret-looking text, and output is scrubbed; prevention beats scrubbing.
+  refuse secret-looking text, and output is scrubbed; prevention beats scrubbing. Both are heuristics:
+  `BIT_ALLOW_SECRET_LOOKING=1` overrides a false positive, and a secret in an unusual shape can still get through.
 - **Effects only your own tools can cause** (a Notion page, an issue): `--manual` plus
   `--undo-manual "delete {{page_url}}"`. `undo` pauses there; you do it, run `bit.py reverted ID --note "..."`,
   and `undo` continues. Record the identifier with `bit.py set page_url=...`.
@@ -128,8 +132,9 @@ written before.
 - Don't remove or rename a step that is still applied: `step --remove` refuses until you `undo` it.
 - A revert you haven't shown the user is a surprise: always dry-run first.
 - Revert undoes what *that run* applied; for an earlier run use `undo --all --run N`.
-- Commands on one timeline are serialised by a lock, so parallel calls are safe. Don't kill `bit.py` while a
-  step runs (a timeout or Ctrl-C kills the step's process group and leaves the step `running`).
+- Commands on one timeline are serialised by a lock, so parallel calls are safe (a step may itself call `bit.py`:
+  the lock is passed down). A timeout records the step as failed (exit 124) and kills its whole process group,
+  background jobs included. Ctrl-C and SIGTERM do the same but leave the step `running` (bit exits 130).
 - No Python? Keep the same files by hand per `references/format.md`. The record matters, not the tool.
 
 ## Commands
@@ -137,4 +142,5 @@ written before.
 `init`, `step`, `check`, `next`, `do`, `begin`, `done`, `auto`, `undo`, `reverted`, `replay`, `fork`,
 `verify`, `status`, `list`, `use`, `set`, `note`; `bit.py <command> --help`. `--tl SLUG` and `--root DIR` go
 before or after the command. Exit codes: `0` ok, `1` a step failed, `2` bad input or plan, `3` paused for a
-decision (manual step, irreversible step, blocked undo). Formats and events: `references/format.md`.
+decision (manual step, irreversible step, blocked undo; a dry-run `undo` exits 0 even when something is blocked).
+Formats and events: `references/format.md`.
