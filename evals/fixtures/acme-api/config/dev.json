@@ -1,0 +1,5 @@
+{
+  "api": "https://dev.example.com",
+  "retries": 1,
+  "timeoutMs": 5000
+}

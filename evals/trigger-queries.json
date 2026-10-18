@@ -1,0 +1,23 @@
+[
+  {"query": "ok so I need you to migrate our staging db from the old schema to v7. back it up first, then run the 14 migration files in db/migrations in order. QA might hate it so I may have to undo the whole thing, maybe not until next week", "should_trigger": true},
+  {"query": "set up my whole dev environment on this fresh laptop (homebrew packages, pyenv, the dotfiles repo, ssh config). I'll need to do the exact same thing on my work machine next month so keep track of everything you do", "should_trigger": true},
+  {"query": "refactor every caller of getUser() across the monorepo to the new async API. if it breaks CI I want to be able to back out cleanly, even tomorrow when you won't remember any of it", "should_trigger": true},
+  {"query": "what exactly did you change in my project yesterday? I want to undo everything from that session", "should_trigger": true},
+  {"query": "rotate the API keys on our three staging services and write it up as a repeatable runbook as you go, we'll do prod after the freeze lifts", "should_trigger": true},
+  {"query": "deploy the new landing page to the s3 bucket + cloudfront, and if the invalidation looks wrong roll it back. I'll want to repeat this for the prod bucket on friday", "should_trigger": true},
+  {"query": "there's a .back-in-time folder in this repo, can you pick up where the last agent left off?", "should_trigger": true},
+  {"query": "clean up old build artifacts and logs across these six services but make it reversible, I don't trust myself with rm -rf", "should_trigger": true},
+  {"query": "do the same config changes you made on the staging server on prod next week. leave me something I can hand to a teammate so they can redo it without you", "should_trigger": true},
+  {"query": "bulk rename the 300 images in assets/ to the new naming scheme and keep a log that lets me revert the renames later if marketing changes their mind", "should_trigger": true},
+
+  {"query": "explain what git revert does versus git reset --hard, I always mix them up", "should_trigger": false},
+  {"query": "write me a python class implementing an undo/redo stack for a text editor, with tests", "should_trigger": false},
+  {"query": "what's the difference between an idempotent operation and a reversible one? I'm preparing a talk", "should_trigger": false},
+  {"query": "fix the typo in the README title, it says 'Instalation'", "should_trigger": false},
+  {"query": "summarize what changed in PR 482 and flag anything risky", "should_trigger": false},
+  {"query": "write a terraform module for an S3 bucket with versioning and a lifecycle rule", "should_trigger": false},
+  {"query": "revert my last commit but keep the changes staged", "should_trigger": false},
+  {"query": "design a Postgres audit-log table that records who changed which row and when, plus the trigger that fills it", "should_trigger": false},
+  {"query": "run the test suite and tell me which tests fail, don't change anything", "should_trigger": false},
+  {"query": "set up a nightly rsync cron job that backs up my home directory to the NAS", "should_trigger": false}
+]

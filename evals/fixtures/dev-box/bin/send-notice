@@ -1,0 +1,5 @@
+#!/bin/sh
+# usage: send-notice <to> <message>
+# Pretends to send an email by appending to ../outbox.log. A sent notice cannot be recalled.
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) TO=$1 MSG=$2" >> "$(dirname "$0")/../outbox.log"
+echo "sent"

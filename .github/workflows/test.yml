@@ -1,0 +1,27 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: git identity (the git-commit recipe and fixtures need one)
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name ci
+      - name: unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: demo runs end to end
+        run: bash examples/demo.sh

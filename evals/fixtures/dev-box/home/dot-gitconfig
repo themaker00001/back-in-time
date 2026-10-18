@@ -1,0 +1,5 @@
+[user]
+	name = Dev Person
+	email = dev@old.example
+[pull]
+	rebase = false

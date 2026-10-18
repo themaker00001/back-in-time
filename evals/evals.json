@@ -1,0 +1,48 @@
+{
+  "skill_name": "back-in-time",
+  "description": "One scenario in three acts. Act 1 is done by an agent with / without the skill; acts 2 and 3 are done by a COLD agent (no skill, no memory of act 1) that only has the project folder as the previous agent left it. That is the real claim: the record has to be enough for someone who wasn't there.",
+  "fixture": "evals/fixtures/acme-api (materialise with evals/setup_fixture.sh <dir>; .env* is git-ignored on purpose, so `git checkout` alone can't undo env-file changes)",
+  "evals": [
+    {
+      "id": 1,
+      "name": "stage-the-app",
+      "prompt": "This folder is our API project (acme-api). Get it ready for the staging environment: bump the version in package.json from 2.0.3 to 2.1.0, create .env.staging from .env but pointing API_URL at https://staging.example.com, add a 2.1.0 entry to the top of CHANGELOG.md saying 'Staging release', and rename config/dev.json to config/staging.json (with its api URL updated to staging too). I may need to roll all of this back, and next week I'll want the same thing done for the production copy of the project, so set things up so that's easy for whoever picks it up.",
+      "expected_output": "The staging work is done correctly, and the folder holds a record complete enough for someone else to revert or repeat it.",
+      "grader": "python3 evals/grade.py work <project-dir> --env staging",
+      "expectations": [
+        "package.json version is 2.1.0",
+        ".env.staging exists, points API_URL at https://staging.example.com, keeps the other settings, and .env itself is unchanged",
+        "CHANGELOG has a 2.1.0 entry above 2.0.3 saying 'Staging release'",
+        "config/staging.json exists with the staging api URL and config/dev.json is gone"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "cold-revert",
+      "depends_on": 1,
+      "prompt": "An earlier session (not you) staged this project for the staging environment, and we've decided against it. Roll the project back so it is exactly as it was before that session started: every file the same, nothing left over. You weren't there, so look around for whatever records exist. Tell me what you did and anything you're unsure about.",
+      "expected_output": "Every original file is byte-for-byte identical to the fixture; .env.staging and config/staging.json are gone.",
+      "grader": "python3 evals/grade.py revert <project-dir>",
+      "expectations": [
+        "all seven original files restored byte-for-byte (including the renamed config/dev.json and git-ignored .env)",
+        ".env.staging, which git cannot see, is removed",
+        "config/staging.json is removed"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "cold-replay-for-production",
+      "depends_on": 1,
+      "prompt": "An earlier session staged the project in `staged/` for the staging environment (version 2.1.0, staging.example.com). Do the same for the production copy of the project in `prod/`: same version 2.1.0, but production.example.com, with everything else analogous (a .env.production, config renamed to production.json, a 'Production release' changelog entry). Don't modify `staged/`. Tell me how you worked out what to do.",
+      "expected_output": "prod/ has the production equivalent of the staging work, with no staging leftovers.",
+      "grader": "python3 evals/grade.py work <prod-dir> --env production --forbid staging",
+      "expectations": [
+        "package.json version is 2.1.0",
+        ".env.production exists with API_URL=https://production.example.com and the other settings kept; .env unchanged",
+        "CHANGELOG has a 2.1.0 entry saying 'Production release'",
+        "config/production.json exists with the production api URL; config/dev.json is gone",
+        "no 'staging' left in the production files"
+      ]
+    }
+  ]
+}

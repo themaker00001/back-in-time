@@ -1,0 +1,5 @@
+# local eval runs; the summary lives in evals/results.md
+back-in-time-workspace/
+__pycache__/
+*.pyc
+.DS_Store
